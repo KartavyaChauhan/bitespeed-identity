@@ -20,11 +20,11 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@prisma/client": "^7.4.2",
+    "@prisma/client": "^5.17.0",
     "@types/express": "^5.0.6",
     "@types/node": "^25.3.2",
     "express": "^5.2.1",
-    "prisma": "^7.4.2",
+    "prisma": "^5.17.0",
     "typescript": "^5.9.3"
   },
   "devDependencies": {
