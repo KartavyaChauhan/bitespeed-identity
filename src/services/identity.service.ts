@@ -4,264 +4,161 @@ import { IdentifyRequest, ConsolidatedContact } from "../utils/types";
 const prisma = new PrismaClient();
 
 /**
- * Recursively fetches all contacts linked to a given contact ID
- * Returns the entire contact group including the primary and all secondaries
- */
-async function getContactGroup(contactId: number): Promise<any[]> {
-  const contact = await prisma.contact.findUnique({
-    where: { id: contactId },
-    include: {
-      secondaryContacts: true,
-      linkedContact: true,
-    },
-  });
-
-  if (!contact) return [];
-
-  const group: any[] = [contact];
-
-  // If this contact has a linked contact (it's secondary), fetch primary and its group
-  if (contact.linkedId) {
-    const primary = await getPrimaryContact(contact.linkedId);
-    if (primary && primary.id !== contact.id) {
-      // Recursively get all contacts from the primary
-      const primaryGroup = await getContactGroup(primary.id);
-      return primaryGroup;
-    }
-    return group;
-  }
-
-  // If this contact is primary, fetch all secondary contacts recursively
-  if (contact.secondaryContacts && contact.secondaryContacts.length > 0) {
-    for (const secondary of contact.secondaryContacts) {
-      group.push(secondary);
-      // Also get any secondaries linked to this secondary
-      const nestedSecondaries = await prisma.contact.findMany({
-        where: {
-          linkedId: secondary.id,
-          deletedAt: null,
-        },
-      });
-      group.push(...nestedSecondaries);
-    }
-  }
-
-  return group;
-}
-
-/**
- * Finds the primary contact for a given contact ID
- * Follows the linkedId chain up to the root primary contact
- */
-async function getPrimaryContact(contactId: number): Promise<any> {
-  let contact = await prisma.contact.findUnique({
-    where: { id: contactId },
-  });
-
-  if (!contact) return null;
-
-  // Keep going up the chain until we find a contact with no linkedId
-  while (contact && contact.linkedId) {
-    contact = await prisma.contact.findUnique({
-      where: { id: contact.linkedId },
-    });
-    if (!contact) break;
-  }
-
-  return contact;
-}
-
-/**
- * Consolidates contact information for a group
- * Ensures primary contact info appears first in arrays
- */
-function consolidateContacts(contacts: any[]): ConsolidatedContact {
-  // Filter out null/deleted contacts and find the primary
-  const validContacts = contacts.filter(
-    (c) => c && c.deletedAt === null
-  );
-
-  if (validContacts.length === 0) {
-    throw new Error("No valid contacts found in group");
-  }
-
-  // The primary contact should be the one with linkPrecedence = "primary"
-  // and if there are multiple, select the oldest
-  const primaryContact = validContacts
-    .filter((c) => c.linkPrecedence === "primary")
-    .sort(
-      (a, b) =>
-        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-    )[0];
-
-  if (!primaryContact) {
-    throw new Error("No primary contact found in group");
-  }
-
-  // Collect emails with primary first
-  const emails: string[] = [];
-  if (primaryContact.email) emails.push(primaryContact.email);
-  
-  // Add secondary emails
-  for (const contact of validContacts) {
-    if (contact.id !== primaryContact.id && contact.email) {
-      emails.push(contact.email);
-    }
-  }
-
-  // Collect phone numbers with primary first
-  const phoneNumbers: string[] = [];
-  if (primaryContact.phoneNumber) phoneNumbers.push(primaryContact.phoneNumber);
-  
-  // Add secondary phone numbers
-  for (const contact of validContacts) {
-    if (contact.id !== primaryContact.id && contact.phoneNumber) {
-      phoneNumbers.push(contact.phoneNumber);
-    }
-  }
-
-  // Get all secondary contact IDs
-  const secondaryContactIds = validContacts
-    .filter(
-      (c) => c.id !== primaryContact.id && c.linkPrecedence === "secondary"
-    )
-    .map((c) => c.id);
-
-  return {
-    primaryContatctId: primaryContact.id,
-    emails,
-    phoneNumbers,
-    secondaryContactIds,
-  };
-}
-
-/**
  * Main identify function
- * Handles the logic for finding/creating contacts and returning consolidated info
+ * Simplified logic without complex recursion
  */
 export async function identify(
   request: IdentifyRequest
 ): Promise<ConsolidatedContact> {
   const { email, phoneNumber } = request;
 
-  // Validation: at least one of email or phoneNumber must be provided
+  // Validation
   if (!email && !phoneNumber) {
-    throw new Error(
-      "At least one of email or phoneNumber must be provided"
-    );
+    throw new Error("At least one of email or phoneNumber must be provided");
   }
 
-  // Step 1: Find all existing contacts matching email or phone
-  const whereConditions: any = {
-    deletedAt: null,
-  };
+  try {
+    // Step 1: Find all existing contacts matching email or phone
+    const whereConditions: any[] = [];
+    if (email) whereConditions.push({ email });
+    if (phoneNumber) whereConditions.push({ phoneNumber });
 
-  const orConditions: any[] = [];
-  if (email) {
-    orConditions.push({ email });
-  }
-  if (phoneNumber) {
-    orConditions.push({ phoneNumber });
-  }
-
-  if (orConditions.length > 0) {
-    whereConditions.OR = orConditions;
-  }
-
-  const existingContacts = await prisma.contact.findMany({
-    where: whereConditions,
-  });
-
-  // Step 2: If no existing contacts, create a new primary contact
-  if (existingContacts.length === 0) {
-    const newContact = await prisma.contact.create({
-      data: {
-        email: email || null,
-        phoneNumber: phoneNumber || null,
-        linkPrecedence: "primary",
+    const existingContacts = await prisma.contact.findMany({
+      where: {
+        OR: whereConditions,
+        deletedAt: null,
       },
+      orderBy: { createdAt: "asc" },
     });
 
-    return consolidateContacts([newContact]);
-  }
-
-  // Step 3: Get all contact groups linked to the matched contacts
-  const contactGroups = new Map<number, any[]>();
-  const primaryContacts = new Set<any>();
-
-  for (const contact of existingContacts) {
-    const primary = await getPrimaryContact(contact.id);
-    if (primary) {
-      const group = await getContactGroup(primary.id);
-      contactGroups.set(primary.id, group);
-      primaryContacts.add(primary);
-    }
-  }
-
-  // Step 4: If we have multiple primary contacts, we need to merge them
-  // Keep the oldest as primary, make others secondary
-  const sortedPrimaries = Array.from(primaryContacts).sort(
-    (a, b) =>
-      new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-  );
-
-  if (sortedPrimaries.length === 0) {
-    throw new Error("No contacts found in the system");
-  }
-
-  const mainPrimary = sortedPrimaries[0];
-  const allContactsInGroup = Array.from(contactGroups.values()).flat();
-
-  // Step 5: Check if we need to create a new secondary contact
-  // Create new secondary if the incoming request has new information
-  const hasNewEmail =
-    email && !allContactsInGroup.find((c) => c.email === email);
-  const hasNewPhone =
-    phoneNumber &&
-    !allContactsInGroup.find((c) => c.phoneNumber === phoneNumber);
-
-  if (hasNewEmail || hasNewPhone) {
-    // New information detected, create a secondary contact
-    await prisma.contact.create({
-      data: {
-        email: email || null,
-        phoneNumber: phoneNumber || null,
-        linkedId: mainPrimary.id,
-        linkPrecedence: "secondary",
-      },
-    });
-  }
-
-  // Step 6: If there are multiple primary contacts, relink secondary ones
-  if (sortedPrimaries.length > 1) {
-    for (let i = 1; i < sortedPrimaries.length; i++) {
-      const primaryToSecondary = sortedPrimaries[i];
-      await prisma.contact.update({
-        where: { id: primaryToSecondary.id },
+    // Step 2: No existing contacts - create new primary
+    if (existingContacts.length === 0) {
+      const newContact = await prisma.contact.create({
         data: {
-          linkedId: mainPrimary.id,
-          linkPrecedence: "secondary",
+          email: email || null,
+          phoneNumber: phoneNumber || null,
+          linkPrecedence: "primary",
         },
       });
 
-      // Also update all contacts linked to this primary
-      const linkedContacts = await prisma.contact.findMany({
-        where: {
-          linkedId: primaryToSecondary.id,
-          deletedAt: null,
-        },
-      });
+      return {
+        primaryContatctId: newContact.id,
+        emails: newContact.email ? [newContact.email] : [],
+        phoneNumbers: newContact.phoneNumber ? [newContact.phoneNumber] : [],
+        secondaryContactIds: [],
+      };
+    }
 
-      for (const linked of linkedContacts) {
+    // Step 3: Find all primary IDs
+    const primaryIds = new Set<number>();
+    for (const contact of existingContacts) {
+      if (contact.linkPrecedence === "primary") {
+        primaryIds.add(contact.id);
+      } else if (contact.linkedId) {
+        primaryIds.add(contact.linkedId);
+      }
+    }
+
+    // Step 4: Get oldest primary
+    const allPrimaries = await prisma.contact.findMany({
+      where: {
+        id: { in: Array.from(primaryIds) },
+        deletedAt: null,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    if (allPrimaries.length === 0) {
+      throw new Error("No primary contact found");
+    }
+
+    const mainPrimary = allPrimaries[0];
+
+    // Step 5: Merge multiple primaries
+    if (allPrimaries.length > 1) {
+      for (let i = 1; i < allPrimaries.length; i++) {
         await prisma.contact.update({
-          where: { id: linked.id },
+          where: { id: allPrimaries[i].id },
+          data: {
+            linkedId: mainPrimary.id,
+            linkPrecedence: "secondary",
+          },
+        });
+
+        await prisma.contact.updateMany({
+          where: {
+            linkedId: allPrimaries[i].id,
+            deletedAt: null,
+          },
           data: { linkedId: mainPrimary.id },
         });
       }
     }
-  }
 
-  // Step 7: Fetch the final consolidated group
-  const finalGroup = await getContactGroup(mainPrimary.id);
-  return consolidateContacts(finalGroup);
+    // Step 6: Get all contacts in group
+    const allGroupContacts = await prisma.contact.findMany({
+      where: {
+        OR: [{ id: mainPrimary.id }, { linkedId: mainPrimary.id }],
+        deletedAt: null,
+      },
+      orderBy: { createdAt: "asc" },
+    });
+
+    // Step 7: Check for new information
+    const existingEmails = allGroupContacts
+      .map((c) => c.email)
+      .filter((e) => e !== null);
+    const existingPhones = allGroupContacts
+      .map((c) => c.phoneNumber)
+      .filter((p) => p !== null);
+
+    const hasNewEmail = email && !existingEmails.includes(email);
+    const hasNewPhone = phoneNumber && !existingPhones.includes(phoneNumber);
+
+    if (hasNewEmail || hasNewPhone) {
+      const newSecondary = await prisma.contact.create({
+        data: {
+          email: email || null,
+          phoneNumber: phoneNumber || null,
+          linkedId: mainPrimary.id,
+          linkPrecedence: "secondary",
+        },
+      });
+      allGroupContacts.push(newSecondary);
+    }
+
+    // Step 8: Build response
+    const emails: string[] = [];
+    const phoneNumbers: string[] = [];
+    const secondaryContactIds: number[] = [];
+
+    // Primary info first
+    if (mainPrimary.email) emails.push(mainPrimary.email);
+    if (mainPrimary.phoneNumber) phoneNumbers.push(mainPrimary.phoneNumber);
+
+    // Secondary info
+    for (const contact of allGroupContacts) {
+      if (contact.id !== mainPrimary.id) {
+        if(contact.email && !emails.includes(contact.email)) {
+          emails.push(contact.email);
+        }
+        if (contact.phoneNumber && !phoneNumbers.includes(contact.phoneNumber)) {
+          phoneNumbers.push(contact.phoneNumber);
+        }
+        if (contact.linkPrecedence === "secondary") {
+          secondaryContactIds.push(contact.id);
+        }
+      }
+    }
+
+    return {
+      primaryContatctId: mainPrimary.id,
+      emails,
+      phoneNumbers,
+      secondaryContactIds,
+    };
+  } catch (error) {
+    console.error("Error in identify service:", error);
+    throw error;
+  }
 }
