@@ -1,7 +1,9 @@
 import { PrismaClient } from "@prisma/client";
 import { IdentifyRequest, ConsolidatedContact } from "../utils/types";
 
-const prisma = new PrismaClient();
+const prisma = new PrismaClient({
+  errorFormat: "pretty",
+});
 
 /**
  * Recursively fetches all contacts linked to a given contact ID
@@ -18,19 +20,31 @@ async function getContactGroup(contactId: number): Promise<any[]> {
 
   if (!contact) return [];
 
-  const group = [contact];
+  const group: any[] = [contact];
 
-  // If this contact has a linked contact (it's secondary), fetch its group
+  // If this contact has a linked contact (it's secondary), fetch primary and its group
   if (contact.linkedId) {
-    const primaryGroup = await getContactGroup(contact.linkedId);
-    return primaryGroup;
+    const primary = await getPrimaryContact(contact.linkedId);
+    if (primary && primary.id !== contact.id) {
+      // Recursively get all contacts from the primary
+      const primaryGroup = await getContactGroup(primary.id);
+      return primaryGroup;
+    }
+    return group;
   }
 
   // If this contact is primary, fetch all secondary contacts recursively
-  if (contact.secondaryContacts.length > 0) {
+  if (contact.secondaryContacts && contact.secondaryContacts.length > 0) {
     for (const secondary of contact.secondaryContacts) {
-      const secondaryGroup = await getContactGroup(secondary.id);
-      group.push(...secondaryGroup.filter((c) => c.id !== contact.id));
+      group.push(secondary);
+      // Also get any secondaries linked to this secondary
+      const nestedSecondaries = await prisma.contact.findMany({
+        where: {
+          linkedId: secondary.id,
+          deletedAt: null,
+        },
+      });
+      group.push(...nestedSecondaries);
     }
   }
 
@@ -39,6 +53,7 @@ async function getContactGroup(contactId: number): Promise<any[]> {
 
 /**
  * Finds the primary contact for a given contact ID
+ * Follows the linkedId chain up to the root primary contact
  */
 async function getPrimaryContact(contactId: number): Promise<any> {
   let contact = await prisma.contact.findUnique({
@@ -48,10 +63,11 @@ async function getPrimaryContact(contactId: number): Promise<any> {
   if (!contact) return null;
 
   // Keep going up the chain until we find a contact with no linkedId
-  while (contact?.linkedId) {
+  while (contact && contact.linkedId) {
     contact = await prisma.contact.findUnique({
       where: { id: contact.linkedId },
     });
+    if (!contact) break;
   }
 
   return contact;
@@ -59,12 +75,17 @@ async function getPrimaryContact(contactId: number): Promise<any> {
 
 /**
  * Consolidates contact information for a group
+ * Ensures primary contact info appears first in arrays
  */
 function consolidateContacts(contacts: any[]): ConsolidatedContact {
   // Filter out null/deleted contacts and find the primary
   const validContacts = contacts.filter(
     (c) => c && c.deletedAt === null
   );
+
+  if (validContacts.length === 0) {
+    throw new Error("No valid contacts found in group");
+  }
 
   // The primary contact should be the one with linkPrecedence = "primary"
   // and if there are multiple, select the oldest
@@ -79,21 +100,25 @@ function consolidateContacts(contacts: any[]): ConsolidatedContact {
     throw new Error("No primary contact found in group");
   }
 
-  // Collect all emails and phone numbers
-  const emailSet = new Set<string>();
-  const phoneSet = new Set<string>();
-
-  // Add primary contact info first
-  if (primaryContact.email) emailSet.add(primaryContact.email);
-  if (primaryContact.phoneNumber)
-    phoneSet.add(primaryContact.phoneNumber);
-
-  // Add secondary contact info
+  // Collect emails with primary first
+  const emails: string[] = [];
+  if (primaryContact.email) emails.push(primaryContact.email);
+  
+  // Add secondary emails
   for (const contact of validContacts) {
-    if (contact.id !== primaryContact.id) {
-      if (contact.email) emailSet.add(contact.email);
-      if (contact.phoneNumber)
-        phoneSet.add(contact.phoneNumber);
+    if (contact.id !== primaryContact.id && contact.email) {
+      emails.push(contact.email);
+    }
+  }
+
+  // Collect phone numbers with primary first
+  const phoneNumbers: string[] = [];
+  if (primaryContact.phoneNumber) phoneNumbers.push(primaryContact.phoneNumber);
+  
+  // Add secondary phone numbers
+  for (const contact of validContacts) {
+    if (contact.id !== primaryContact.id && contact.phoneNumber) {
+      phoneNumbers.push(contact.phoneNumber);
     }
   }
 
@@ -106,8 +131,8 @@ function consolidateContacts(contacts: any[]): ConsolidatedContact {
 
   return {
     primaryContatctId: primaryContact.id,
-    emails: Array.from(emailSet),
-    phoneNumbers: Array.from(phoneSet),
+    emails,
+    phoneNumbers,
     secondaryContactIds,
   };
 }
@@ -181,6 +206,10 @@ export async function identify(
     (a, b) =>
       new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
   );
+
+  if (sortedPrimaries.length === 0) {
+    throw new Error("No contacts found in the system");
+  }
 
   const mainPrimary = sortedPrimaries[0];
   const allContactsInGroup = Array.from(contactGroups.values()).flat();
