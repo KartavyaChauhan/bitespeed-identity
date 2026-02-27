@@ -312,4 +312,6 @@ Built with care for Bitespeed
 
 ---
 
-**Deployed at**: [Add deployed URL here after deployment]
+**Deployed at**: https://bitespeed-identity-110j.onrender.com
+
+**GitHub Repository**: https://github.com/KartavyaChauhan/bitespeed-identity
