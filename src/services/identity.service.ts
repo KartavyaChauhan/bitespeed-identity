@@ -1,9 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import { IdentifyRequest, ConsolidatedContact } from "../utils/types";
 
-const prisma = new PrismaClient({
-  errorFormat: "pretty",
-});
+const prisma = new PrismaClient();
 
 /**
  * Recursively fetches all contacts linked to a given contact ID
