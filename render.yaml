@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: bitespeed-identity
+    env: node
+    plan: free
+    buildCommand: npm install && npm run build && npx prisma migrate deploy
+    startCommand: npm run start
+    envVars:
+      - key: DATABASE_URL
+        scope: build,runtime
+        value: "" # Set this in Render dashboard
+      - key: NODE_ENV
+        scope: build,runtime
+        value: production
